@@ -151,6 +151,8 @@ static void cmd_help(void) {
          "  rreg <0|1> <addr>          read a config register (0x00-0x2E)\n"
          "  rf [freq_hz] [dbm]         bring BOTH radios up (433.92M, -30 dBm)\n"
          "  loop <tx 0|1> [count]      radio-to-radio packet test, on board\n"
+         "  tx <radio 0|1> [delay_ms]  sustained repeated-packet TX for EMC "
+         "measurement (NOT CW); any key stops it\n"
          "  pins                       report the SPI0 and GDO pin map\n"
          "  flashcrc [passes]                 CRC 256 KB of XIP repeatedly "
          "(default 200 passes, ~50-150 ms each, ~15-30 s total)\n"
@@ -168,7 +170,7 @@ static void cmd_help(void) {
          "  fs read <path>             read back and verify that pattern\n"
          "  fs rm <path>               delete a file\n"
          "  fs format                  DESTRUCTIVE -- rewrite the file table\n");
-    DIAG("OK help 20 commands\n");
+    DIAG("OK help 21 commands\n");
 }
 
 static void cmd_radio(void) {
@@ -414,6 +416,68 @@ static void cmd_loop(int argc, char **argv) {
          tx, rx, count, sent_ok, got, crc_ok,
          rssi_n ? (rssi_sum / (long)rssi_n) : 0, (unsigned)last_lqi,
          (unsigned)s_rf_hz, s_rf_dbm);
+}
+
+/* Sustained transmission for EMC/emissions measurement -- run 'rf' first to
+ * pick the frequency and power, then this keys one radio and repeats a
+ * packet indefinitely until any key arrives on the console, instead of
+ * `loop`'s bounded 1-100-then-idle shape.
+ *
+ * NOT AN UNMODULATED CARRIER. This repeats the same modulated packet
+ * cc1101_send_packet() already sends for `loop` -- it does not attempt CW.
+ * Putting the CC1101 into a true continuous-wave/unmodulated test mode needs
+ * low-level register configuration (MDMCFG2 modulation format, PKTCTRL0
+ * framing, and confirming the synthesiser stays locked with no packet
+ * end) that this driver does not expose and that would need verifying
+ * against a real spectrum analyzer to trust -- guessing it from the
+ * datasheet alone and shipping it unverified would be worse than not having
+ * it. If the test procedure specifically requires CW rather than a repeated
+ * modulated packet, this command does not produce that; say so and it can be
+ * added properly, checked against actual hardware. */
+static void cmd_tx(int argc, char **argv) {
+    if (!s_bound) { DIAG("ERR tx not-bound\n"); return; }
+    if (!s_rf_ready) { DIAG("ERR tx run 'rf' first\n"); return; }
+    if (argc < 2 || argc > 3) {
+        DIAG("ERR tx usage: tx <radio 0|1> [delay_ms]\n");
+        return;
+    }
+    int idx;
+    if (!parse_radio(argv[1], &idx)) {
+        DIAG("ERR tx bad radio (0=CS0, 1=CS1)\n");
+        return;
+    }
+    long delay_ms = 10;
+    if (argc == 3) {
+        bool ok;
+        delay_ms = parse_long(argv[2], &ok);
+        if (!ok || delay_ms < 0 || delay_ms > 60000) {
+            DIAG("ERR tx bad delay_ms (0-60000)\n");
+            return;
+        }
+    }
+
+    uint8_t payload[BENCH_RF_PAYLOAD_LEN] = {'F', 'W', 'O', 'G', 0u, 0u};
+    DIAG("OK tx started cs%d freq_hz=%u dbm=%d delay_ms=%ld -- repeated "
+         "packets, NOT an unmodulated carrier; press any key to stop\n",
+         idx, (unsigned)s_rf_hz, s_rf_dbm, delay_ms);
+
+    unsigned long sent = 0u, tried = 0u;
+    uint8_t seq = 0u;
+    while (getchar_timeout_us(0) == PICO_ERROR_TIMEOUT) {
+        board_watchdog_kick();
+        payload[4] = seq;
+        payload[5] = (uint8_t)~seq;
+        tried++;
+        if (cc1101_send_packet(&s_radio[idx], payload, BENCH_RF_PAYLOAD_LEN)) {
+            sent++;
+        }
+        seq++;
+        if (delay_ms > 0) sleep_ms((uint32_t)delay_ms);
+    }
+    /* Leave the radio idle rather than mid-transmit-loop when the console
+       returns control -- same reasoning as `loop`'s idle-on-exit. */
+    cc1101_idle(&s_radio[idx]);
+    DIAG("OK tx stopped cs%d tried=%lu keyed=%lu\n", idx, tried, sent);
 }
 
 static void cmd_pins(void) {
@@ -988,6 +1052,8 @@ static void process_line(char *line) {
         cmd_rf(argc, argv);
     } else if (streq(cmd, "loop")) {
         cmd_loop(argc, argv);
+    } else if (streq(cmd, "tx")) {
+        cmd_tx(argc, argv);
     } else if (streq(cmd, "pins")) {
         cmd_pins();
     } else if (streq(cmd, "flashcrc")) {
